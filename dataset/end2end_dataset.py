@@ -18,6 +18,7 @@ import time
 import sys
 from pylatexenc.latex2text import LatexNodes2Text
 import traceback
+from pathlib import Path
 
 @DATASET_REGISTRY.register("end2end_dataset")
 class End2EndDataset():
@@ -26,6 +27,7 @@ class End2EndDataset():
         pred_folder = cfg_task['dataset']['prediction']['data_path']
         self.match_method = cfg_task['dataset'].get('match_method', 'quick_match')
         filtered_types = cfg_task['dataset'].get('filter')
+        self._pred_file_index = self._build_pred_file_index(pred_folder)
 
         with open(gt_path, 'r') as f:
             gt_samples = json.load(f)
@@ -150,6 +152,50 @@ class End2EndDataset():
         return formula_matches
 
     # 对gt和预测结果进行匹配，调用 process_get_matched_elements 函数进行匹配处理，最终将匹配结果整理成一个字典返回
+    def _build_pred_file_index(self, pred_folder: str):
+        pred_root = Path(pred_folder)
+        if not pred_root.exists():
+            raise FileNotFoundError(f"Prediction folder not found: {pred_root}")
+        if not pred_root.is_dir():
+            raise NotADirectoryError(f"Prediction path must be a directory: {pred_root}")
+
+        index = {}
+        duplicates = defaultdict(list)
+        for suffix in (".md", ".mmd"):
+            for p in pred_root.rglob(f"*{suffix}"):
+                name = p.name
+                if name in index:
+                    duplicates[name].append(str(p))
+                else:
+                    index[name] = str(p)
+
+        if duplicates:
+            sample = []
+            for name, paths in list(duplicates.items())[:20]:
+                sample.append(f"{name}: {index[name]} | {', '.join(paths)}")
+            raise ValueError(
+                "Duplicate prediction filenames found under pred_folder (recursive search requires unique filenames). "
+                "Examples:\n" + "\n".join(sample)
+            )
+
+        return index
+
+    def _find_pred_path(self, pred_folder: str, img_name: str):
+        # Keep the legacy resolution order but search recursively via an index.
+        # base: strip image extension (assumes .jpg/.png like original code)
+        base = img_name[:-4]
+        candidates = [
+            f"{base}.md",
+            f"{base.replace('.pdf', '')}.mmd",  # nougat
+            f"{base.replace('.pdf', '')}.md",   # marker
+            f"{img_name}.md",                   # mineru
+        ]
+        for fname in candidates:
+            resolved = self._pred_file_index.get(fname)
+            if resolved:
+                return resolved
+        return None
+
     def get_matched_elements(self, gt_samples, pred_folder):
         plain_text_match = []
         display_formula_match = []
@@ -162,16 +208,10 @@ class End2EndDataset():
             img_name = os.path.basename(sample["page_info"]["image_path"])
             
             # print('Process: ', img_name)
-            pred_path = os.path.join(pred_folder, img_name[:-4] + '.md')
-            if not os.path.exists(pred_path):
-                pred_path = os.path.join(pred_folder, img_name[:-4].replace('.pdf', "") + '.mmd')  # nougat
-                if not os.path.exists(pred_path):
-                    pred_path = os.path.join(pred_folder, img_name[:-4].replace('.pdf', "") + '.md')  # marker
-                    if not os.path.exists(pred_path):
-                        pred_path = os.path.join(pred_folder, img_name + '.md')
-                        if not os.path.exists(pred_path):  # mineru
-                            print(f'!!!WARNING: No prediction for {img_name}')
-                            continue
+            pred_path = self._find_pred_path(pred_folder, img_name)
+            if not pred_path:
+                print(f'!!!WARNING: No prediction for {img_name}')
+                continue
 
             process_bar.set_description(f'Processing {os.path.basename(pred_path)}')
             pred_content = read_md_file(pred_path)
